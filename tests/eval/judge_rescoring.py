@@ -153,10 +153,18 @@ async def judge_cells(cells: list[dict[str, Any]], *, concurrency: int = 8) -> l
 
     async def one(cell: dict[str, Any]) -> dict[str, Any]:
         async with sem:
-            resp = await client.messages.create(
-                model=JUDGE_MODEL, max_tokens=200, temperature=0.0,
-                messages=[{"role": "user", "content": build_judge_messages(cell)}],
-            )
+            # transport retry only (rate limits / transient 5xx); scoring config unchanged
+            for attempt in range(4):
+                try:
+                    resp = await client.messages.create(
+                        model=JUDGE_MODEL, max_tokens=200, temperature=0.0,
+                        messages=[{"role": "user", "content": build_judge_messages(cell)}],
+                    )
+                    break
+                except Exception:
+                    if attempt == 3:
+                        raise
+                    await asyncio.sleep(5 * 2**attempt)
         text = resp.content[0].text.strip()
         try:
             start, end = text.index("{"), text.rindex("}") + 1

@@ -23,6 +23,9 @@ pytest wrapper asserts only run validity (guards + both arms + cold/warm present
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import random
 import uuid
 from dataclasses import dataclass, field
@@ -35,6 +38,22 @@ from minima.seeding.items import SeedItem, build_item
 from tests.eval import harness as h
 
 REAL, SHUFFLED = "real", "shuffled"
+
+
+async def _retry(coro_fn, *, attempts: int = 4, base_delay: float = 5.0, what: str = "op"):
+    """Retry transient server errors (408s under load killed a 4.4h run on 2026-07-14).
+
+    A multi-hour experiment must not die on one slow request; only repeated failure aborts.
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return await coro_fn()
+        except Exception as exc:  # noqa: BLE001 — adapter raises SDK-specific transport errors
+            last = exc
+            if i < attempts - 1:
+                await asyncio.sleep(base_delay * (2 ** i))
+    raise RuntimeError(f"{what} failed after {attempts} attempts: {last}") from last
 
 
 @dataclass(slots=True)
@@ -128,7 +147,11 @@ async def _seed_chunk(memory: MubitMemory, lane: str, chunk: list[h.Row], offset
             items.append(build_item(SeedItem(f"h2train-{i}-{m}", content, rec, ["seed:h2eval"])))
     inserted = 0
     for start in range(0, len(items), 100):
-        res = await memory.batch_insert(run_id=lane, items=items[start:start + 100], deduplicate=True)
+        chunk_items = items[start:start + 100]
+        res = await _retry(
+            lambda ci=chunk_items: memory.batch_insert(run_id=lane, items=ci, deduplicate=True),
+            what=f"batch_insert[{lane}@{start}]",
+        )
         inserted += int(res.get("count", 0))
     return inserted
 
@@ -136,13 +159,27 @@ async def _seed_chunk(memory: MubitMemory, lane: str, chunk: list[h.Row], offset
 async def _score_probe(memory: MubitMemory, lane: str, probe: list[h.Row], cards: dict,
                        candidates: list[str], premium: str, slider: float,
                        settings: Settings) -> tuple[float, float, dict[str, int], list[float], list[float]]:
+    """Score the fixed probe against the frozen memory state.
+
+    Probe recalls run CONCURRENTLY (bounded): memory is frozen during scoring, so each
+    probe row's recall is independent — parallelism changes wall-clock only, never the
+    measurement (amendment log #7). Order of results is preserved by gather."""
+    sem = asyncio.Semaphore(int(os.getenv("MINIMA_H2_PROBE_CONCURRENCY", "8")))
+
+    async def one(row: h.Row) -> str:
+        async with sem:
+            aggs, _, _ = await _retry(
+                lambda r=row: h._recall_aggs(memory, lane, r, candidates, settings),
+                what=f"probe_recall[{lane}]",
+            )
+        return h._pick(aggs, cards, row.task_type, slider, h._est_in_tokens(row.prompt), settings)
+
+    models = await asyncio.gather(*(one(r) for r in probe))
     acc = cost = 0.0
     picks: dict[str, int] = {}
     row_scores: list[float] = []
     row_costs: list[float] = []
-    for row in probe:
-        aggs, _, _ = await h._recall_aggs(memory, lane, row, candidates, settings)
-        m = h._pick(aggs, cards, row.task_type, slider, h._est_in_tokens(row.prompt), settings)
+    for row, m in zip(probe, models, strict=True):
         picks[m] = picks.get(m, 0) + 1
         acc += row.scores[m]
         cost += row.costs[m]
@@ -252,6 +289,18 @@ async def run_learning_curve(
                     retention=(acc / prem_acc) if prem_acc else 1.0,
                     pick_counts=picks, row_scores=rs, row_costs=rc,
                 ))
+                # Crash insurance: persist every scored point immediately (a 408 at hour 4.4
+                # once destroyed a full run's in-memory results — never again).
+                partial = os.getenv("MINIMA_H2_OUT")
+                if partial:
+                    with open(partial + ".partial", "w") as f:
+                        json.dump([{
+                            "arm": p.arm, "ordering": p.ordering_seed, "memory": p.memory_size,
+                            "accuracy": p.accuracy, "cost": p.cost,
+                            "savings": p.savings_vs_premium, "retention": p.retention,
+                            "picks": p.pick_counts, "row_scores": p.row_scores,
+                            "row_costs": p.row_costs,
+                        } for p in points], f)
 
     res = H2Result(candidates=list(candidates), premium=premium, slider=slider,
                    probe_n=len(probe), checkpoints=checkpoints, ordering_seeds=ordering_seeds,
